@@ -8,16 +8,24 @@ from pathlib import Path
 from typing import Any
 
 import urllib3
-from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Body, Cookie, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 LEGACY_SECRET = "WORKSHOP_SECRET_2026"
+SESSION_COOKIE = "workshop_session"
 
 
-def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
+def legacy_identity(
+    request: Request,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, str]:
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        if request.headers.get("origin") != request.app.state.allowed_origin:
+            raise HTTPException(status_code=403, detail="Origin not allowed")
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
+        if session_cookie is None:
+            raise ValueError("missing session")
+        decoded = base64.b64decode(session_cookie).decode("utf-8")
         parts = decoded.split("|")
         if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
             raise ValueError("invalid token")
@@ -26,9 +34,14 @@ def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
         raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
 
 
-def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
+def create_app(
+    db_path: str | None = None,
+    upload_dir: str | None = None,
+    allowed_origin: str | None = None,
+) -> FastAPI:
     selected_db = db_path or os.getenv("WORKSHOP_DB_PATH", "./data/workshop.db")
     selected_uploads = upload_dir or os.getenv("WORKSHOP_UPLOAD_DIR", "./uploads")
+    selected_origin = allowed_origin or os.getenv("APP_ALLOWED_ORIGIN", "http://localhost:4200")
     Path(selected_db).parent.mkdir(parents=True, exist_ok=True)
     Path(selected_uploads).mkdir(parents=True, exist_ok=True)
 
@@ -45,12 +58,13 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
     app = FastAPI(title="Workshop Requirements API", version="0.1.0")
     app.state.connection = connection
     app.state.upload_dir = selected_uploads
+    app.state.allowed_origin = selected_origin
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[selected_origin],
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["content-type"],
     )
 
     def as_task(row: sqlite3.Row) -> dict[str, Any]:
