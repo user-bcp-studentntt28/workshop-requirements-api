@@ -4,16 +4,19 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.main import create_app
+from app.main import LEGACY_SECRET, create_app
 
 
 def token(username: str = "student", role: str = "STUDENT") -> str:
-    raw = f"{username}|{role}|{int(time.time()) + 3600}|WORKSHOP_SECRET_2026"
+    raw = f"{username}|{role}|{int(time.time()) + 3600}|{LEGACY_SECRET}"
     return base64.b64encode(raw.encode()).decode()
 
 
 def headers(username: str = "student", role: str = "STUDENT") -> dict[str, str]:
-    return {"Authorization": f"Bearer {token(username, role)}"}
+    return {
+        "Cookie": f"workshop_session={token(username, role)}",
+        "Origin": "http://localhost:4200",
+    }
 
 
 def test_lists_seeded_tasks(tmp_path: Path) -> None:
@@ -51,8 +54,70 @@ def test_uploads_requirement(tmp_path: Path) -> None:
     assert (upload_dir / "requirements.txt").exists()
 
 
-def test_rejects_invalid_token(tmp_path: Path) -> None:
+def test_rejects_invalid_session_cookie(tmp_path: Path) -> None:
     app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
     with TestClient(app) as client:
-        response = client.get("/api/tasks", headers={"Authorization": "Bearer invalid"})
+        response = client.get("/api/tasks", headers={"Cookie": "workshop_session=invalid"})
     assert response.status_code == 401
+
+
+def test_rejects_state_change_without_allowed_origin(tmp_path: Path) -> None:
+    app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
+    request_headers = headers()
+    request_headers.pop("Origin")
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tasks",
+            headers=request_headers,
+            json={"title": "Add tests"},
+        )
+    assert response.status_code == 403
+
+
+def test_rejects_state_change_from_untrusted_origin(tmp_path: Path) -> None:
+    app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
+    request_headers = headers()
+    request_headers["Origin"] = "https://untrusted.example"
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tasks",
+            headers=request_headers,
+            json={"title": "Add tests"},
+        )
+    assert response.status_code == 403
+
+
+def test_does_not_accept_legacy_bearer_header(tmp_path: Path) -> None:
+    app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/tasks",
+            headers={"Authorization": f"Bearer {token()}"},
+        )
+    assert response.status_code == 401
+
+
+def test_cors_allows_credentials_only_for_configured_origin(tmp_path: Path) -> None:
+    app = create_app(
+        str(tmp_path / "workshop.db"),
+        str(tmp_path / "uploads"),
+        allowed_origin="http://localhost:4200",
+    )
+    with TestClient(app) as client:
+        allowed = client.options(
+            "/api/tasks",
+            headers={
+                "Origin": "http://localhost:4200",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        rejected = client.options(
+            "/api/tasks",
+            headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+    assert allowed.headers["access-control-allow-origin"] == "http://localhost:4200"
+    assert allowed.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-origin" not in rejected.headers
